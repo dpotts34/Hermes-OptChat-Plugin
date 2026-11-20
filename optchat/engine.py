@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from agent.context_engine import ContextEngine, ContextEngineError
+from agent.context_engine import ContextEngine
 
 from . import batch
 from .config import Settings
+from .hermes_compat import ContextEngineError
 from .store import VIEW_ACK, Store, encoded, size, visible
 from .worker import Worker
 

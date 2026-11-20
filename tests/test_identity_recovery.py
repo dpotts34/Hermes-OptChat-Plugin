@@ -14,6 +14,7 @@ import pytest
 from optchat.config import Settings
 from optchat.store import Store
 from optchat.images import page
+from optchat.hermes_compat import encode_content
 
 SESSION = "identity-regression"
 SETTINGS = Settings(compression_policy="on_demand", chunk_limit="bytes")
@@ -99,8 +100,7 @@ def tool_result(engine, name, args):
 
 
 def message(conn, row, uid, text, role="user", **fields):
-    from hermes_state import SessionDB
-    content = SessionDB._encode_content(text)
+    content = encode_content(text)
     data = dict(id=row, session_id=SESSION, role=role, content=content,
                 timestamp=float(row), message_uid=uid, **fields)
     conn.execute(f"INSERT INTO messages ({','.join(data)}) VALUES ({','.join('?' for _ in data)})", tuple(data.values()))

@@ -9,7 +9,7 @@ import pytest
 from optchat.config import Settings
 from optchat.store import Store
 from optchat.worker import Worker
-from agent.context_engine import ContextEngineError
+from optchat.hermes_compat import ContextEngineError
 from test_identity_recovery import engine_at, message, workspace
 
 def original_text(store, event):

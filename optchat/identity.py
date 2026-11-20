@@ -5,6 +5,8 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
+from .hermes_compat import decode_content, tool_call_id_apis
+
 SCHEMA_VERSION = "1"
 
 
@@ -26,10 +28,6 @@ def decoded(value, fallback=None):
     except (ValueError, TypeError):
         return value
 
-
-def decode_content(value):
-    from hermes_state import SessionDB
-    return SessionDB._decode_content(value)
 
 
 def uid(value):
@@ -59,7 +57,7 @@ def call_occurrences(row):
     for position, call in enumerate(calls):
         if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
             raise ValueError(f"Invalid tool call on Hermes row {row['id']}")
-        from agent.message_sanitization import coalesce_tool_call_id, tool_call_id_variants
+        coalesce_tool_call_id, tool_call_id_variants = tool_call_id_apis()
         provider_id = coalesce_tool_call_id(call)
         occurrence = mapping.get(provider_id)
         if occurrence is None:
