@@ -18,7 +18,12 @@ fail-closed context preparation, and plugin-safe live configuration through
 `update_model`. The host must also retain logical message UIDs and per-occurrence tool
 UIDs in its session database. An unpatched Hermes release is not sufficient; no
 released Hermes version is claimed to contain this integration. Install the matching
-core changes before enabling this plugin.
+core changes ([hermes-agent#151679](https://github.com/NousResearch/hermes-agent/pull/151679))
+before enabling this plugin.
+
+The plugin reads stored message content through Hermes's public
+`session_rules.turns.decode_content` on current cores and falls back to the older
+`SessionDB` codec on earlier ones; tool-call ID helpers are resolved the same way.
 
 ## Setup
 
@@ -93,6 +98,10 @@ interrupted turn; preparation failures use `ContextEngineError` and produce an e
 receipt without sending an unbounded transcript. Background summaries may continue
 after a cancelled foreground wait until the owning session closes.
 
+## Context Illustration
+
+![Illustration of OptChat's summary tree, context views, and reusable prefixes](diagrams/memory-flow.gif)
+
 ## Offline recovery
 
 Stop every Hermes process that could write the source session. Keep a consistent
@@ -149,7 +158,6 @@ sessions, and do not remove or relocate the preserved `SOURCE_ARCHIVE`. Resume t
 same session with the matching core and plugin. Recovery does not run a model;
 uncached summaries are prepared on resume and may require substantial provider work
 within the configured readiness deadline (`settle_seconds`).
-
 
 
 ## Configuration
