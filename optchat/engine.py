@@ -14,7 +14,7 @@ from agent.context_engine import ContextEngine
 
 from . import batch
 from .config import Settings
-from .hermes_compat import ContextEngineError
+from .hermes_compat import ContextEngineError, image_turn_cut
 from .store import VIEW_ACK, Store, encoded, size, visible
 from .worker import Worker
 
@@ -347,6 +347,10 @@ class OptChatEngine(ContextEngine):
                 if len(hits) != 1:
                     raise RuntimeError("The current ask has no unambiguous content-block boundary")
                 self.cut_offset = hits[0]
+            elif (image_cut := image_turn_cut(content, self.user_content)) is not None:
+                # Hermes's model copy of an image ask differs from its admitted copy only in
+                # image notes; any other change still stops the turn below.
+                self.cut_offset = image_cut
             else:
                 raise RuntimeError("Hermes changed the admitted user content")
             self.wire_anchor = copy.deepcopy(content)

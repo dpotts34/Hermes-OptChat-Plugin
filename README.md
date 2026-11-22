@@ -24,6 +24,10 @@ before enabling this plugin.
 The plugin reads stored message content through Hermes's public
 `session_rules.turns.decode_content` on current cores and falls back to the older
 `SessionDB` codec on earlier ones; tool-call ID helpers are resolved the same way.
+An image ask has two Hermes copies: the admitted one ends with `@image:<path>` lines, the
+model copy carries the image parts with `[Image attached at: <path>]` hints (or vision
+notes in text mode). The plugin matches them through Hermes's `split_image_notes`; any
+other difference in the current ask still stops the turn.
 
 ## Setup
 
