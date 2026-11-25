@@ -18,7 +18,7 @@ def pre_turn(session_id, turn_id, conversation_history, **kwargs):
 def pre_tool(session_id=None, tool_call_id=None, tool_name=None, args=None, **kwargs):
     engine = current(session_id)
     if engine and tool_call_id:
-        store = engine.worker.store
+        store = engine.writer().store
         store.sync_hermes(engine.home,engine.session)
         store.observe_tool("pre",tool_call_id,tool_name=tool_name,args=args,
                            tool_call_uid=kwargs.get("tool_call_uid"),
@@ -28,12 +28,13 @@ def pre_tool(session_id=None, tool_call_id=None, tool_name=None, args=None, **kw
 def post_tool(session_id=None, tool_call_id=None, tool_name=None, result=None, **kwargs):
     engine = current(session_id)
     if engine and tool_call_id:
-        store = engine.worker.store
+        worker = engine.writer()
+        store = worker.store
         store.observe_tool("post",tool_call_id,tool_name=tool_name,result=result,
                            tool_call_uid=kwargs.get("tool_call_uid"),
                            turn_id=kwargs.get("turn_id"),api_request_id=kwargs.get("api_request_id"))
         store.sync_hermes(engine.home,engine.session)
-        engine.worker.notify()
+        worker.notify()
 
 
 def register(ctx):

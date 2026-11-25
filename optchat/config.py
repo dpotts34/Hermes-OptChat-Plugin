@@ -25,6 +25,11 @@ class Settings:
     merge_lanes: int = 4
     summary_concurrency: int = 8
     cache_split: float = 0.3
+    # Seconds without any turn or summary work before this app releases the chat's archive so
+    # another Hermes app (Desktop, the gateway) can open it; 0 never releases. A turn left open
+    # (an abnormal exit skipped its completion) is released after idle_release_max_seconds.
+    idle_release_seconds: float = 60
+    idle_release_max_seconds: float = 900
 
     def __post_init__(self):
         for name, choices in (("summary_boundary",("event","user_turn")),
@@ -39,7 +44,7 @@ class Settings:
             if isinstance(value,bool) or not isinstance(value,int):
                 raise ValueError(f"OptChat {name} must be an integer")
         for name in ("settle_seconds","retry_seconds","summary_timeout","cache_split",
-                     "compression_trigger","batch_wait_seconds"):
+                     "compression_trigger","batch_wait_seconds","idle_release_seconds","idle_release_max_seconds"):
             value = getattr(self,name)
             if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):
                 raise ValueError(f"OptChat {name} must be a finite number")
@@ -55,6 +60,8 @@ class Settings:
             raise ValueError("OptChat needs turn_source_bytes >= turn_node_bytes >= 256")
         if not 0 < self.compression_trigger <= 1 or self.batch_wait_seconds < 0:
             raise ValueError("OptChat needs 0 < compression_trigger <= 1 and batch_wait_seconds >= 0")
+        if self.idle_release_seconds < 0 or self.idle_release_max_seconds <= 0:
+            raise ValueError("OptChat needs idle_release_seconds >= 0 and idle_release_max_seconds > 0")
         if self.batch_input_bytes < 1024 or self.batch_output_bytes < self.summary_bytes:
             raise ValueError("OptChat batch budgets must fit a summary and at least 1024 input bytes")
         if self.view_limit is not None:

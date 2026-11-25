@@ -21,6 +21,7 @@ class Worker:
         self.changed = threading.Condition()
         self.wake = threading.Event()
         self.stop = threading.Event()
+        self.closed = threading.Event()  # set once its store is closed and the archive lock released
         self.errors = {}
         self.busy = set()
         self.snapshots = {}
@@ -394,5 +395,13 @@ class Worker:
         # The last exiting worker also releases ownership when a provider finishes
         # after close's deadline. Never unlock an archive with an active writer.
         self.store.close()
+        self.closed.set()
         if self.on_close:
             self.on_close(self)
+
+    def idle(self):
+        """No summary in flight, nobody waiting for one, and no ready summary job."""
+        with self.claim:
+            if self.busy or self.waiters:
+                return False
+        return self.store.ready_job(None,set()) is None

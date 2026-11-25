@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import logging
 import sys
 import threading
 import time
@@ -16,22 +17,57 @@ from agent.context_engine import ContextEngine
 from . import batch
 from .config import Settings
 from .hermes_compat import ContextEngineError, image_turn_cut
-from .store import VIEW_ACK, Store, encoded, size, visible
+from .store import VIEW_ACK, ArchiveInUse, Store, encoded, size, visible
 from .worker import Worker
 
 STATE = sys.modules.setdefault("_optchat_runtime", SimpleNamespace(engines={}, lock=threading.RLock()))
+logger = logging.getLogger(__name__)
 # One archive writer per (home, session) in this process. Hermes may build a new agent, so a new engine,
 # for a session whose old agent it only soft-released (cache eviction never ends the session), so engines
-# attach to the open writer; it closes when the last attached engine ends. Another process stays refused
-# by the archive lock.
+# attach to the open writer. Long-running Hermes processes (the gateway, Desktop's backend) never end a
+# session either, so an idle writer is released for another process and reopened on its next use; the
+# archive lock still refuses a second process while one holds it.
 if not hasattr(STATE, "writers"):
     STATE.writers = {}
+if not hasattr(STATE, "opening"):
+    STATE.opening = {}
 
 
-def _attached(key, worker):
-    """The live engines attached to *worker*, the writer registered for *key* (caller holds STATE.lock)."""
-    entry = STATE.writers.get(key)
-    return entry[1] if entry is not None and entry[0] is worker else weakref.WeakSet()
+class _Writer:
+    """A session's open archive writer and the engines using it (STATE.lock guards every field)."""
+
+    def __init__(self, key, worker, engine):
+        self.key, self.worker = key, worker
+        self.engines = weakref.WeakSet([engine])
+        self.touched = time.monotonic()
+
+
+def _release_when_idle(entry, settings):
+    """Close *entry*'s writer once its session has no turn and no summary work for the configured time."""
+    poll = max(0.05, min(5.0, settings.idle_release_seconds / 4))
+    while not entry.worker.stop.wait(poll):
+        with STATE.lock:
+            if STATE.writers.get(entry.key) is not entry:
+                return
+            quiet = time.monotonic() - entry.touched
+            turn = any(engine.turn is not None for engine in list(entry.engines))
+        if quiet < settings.idle_release_seconds:
+            continue
+        overdue = quiet >= settings.idle_release_max_seconds
+        if not overdue and (turn or not entry.worker.idle()):
+            continue
+        with STATE.lock:
+            # Recheck under the lock: a use that touched it meanwhile keeps the writer.
+            if STATE.writers.get(entry.key) is not entry or time.monotonic() - entry.touched < settings.idle_release_seconds:
+                continue
+            entry.worker.stop.set()
+        logger.info("OptChat released the idle archive of session %s for other Hermes apps", entry.key[1])
+        try:
+            entry.worker.close()
+        except RuntimeError as exc:
+            # A summary call outlived close's deadline; its thread releases the lock when it returns.
+            logger.warning("OptChat archive of session %s closes after its running summary: %s", entry.key[1], exc)
+        return
 
 
 INSTRUCTIONS = """OptChat supplies the entire prior conversation as a bounded summary view in <chat>.
@@ -281,16 +317,14 @@ class OptChatEngine(ContextEngine):
     def on_session_start(self, session_id, hermes_home=None, **kwargs):
         from hermes_constants import get_hermes_home
         home = str(Path(hermes_home or get_hermes_home()).resolve())
-        key = (home,session_id)
         if not session_id:
             self.problem = "A durable Hermes session ID is required"
             return
         if self.session == session_id and self.worker:
             return
-        if self.worker:
+        if self.session:
             self.on_session_end(self.session,[])
         self.home,self.session = home,session_id
-        store = None
         try:
             if self.config_error:
                 raise RuntimeError(self.config_error)
@@ -300,36 +334,81 @@ class OptChatEngine(ContextEngine):
             memory = cfg.get("memory",{})
             if memory.get("memory_enabled",True) or memory.get("user_profile_enabled",True) or memory.get("provider","none") not in ("none","", "default","builtin"):
                 raise RuntimeError("Set memory.memory_enabled=false, user_profile_enabled=false, provider=none for OptChat")
+            self.problem = None
+            self.writer()
+        except ArchiveInUse:
+            pass  # another Hermes app has this chat open; the next use reopens it once released
+        except Exception as exc:
+            self.problem = str(exc)
+
+    def writer(self):
+        """This session's open archive writer, reopened after an idle release; raises ArchiveInUse
+        while another Hermes app holds it."""
+        worker = self.worker
+        if worker is not None and not worker.stop.is_set():
+            with STATE.lock:
+                if (entry := STATE.writers.get((self.home,self.session))) is not None and entry.worker is worker:
+                    entry.touched = time.monotonic()
+            return worker
+        if self.problem:
+            raise RuntimeError(self.problem)
+        if not self.session:
+            raise RuntimeError("OptChat was not initialized")
+        key = (self.home,self.session)
+        deadline = time.monotonic()+self.settings.summary_timeout+5
+        while True:
             with STATE.lock:
                 entry = STATE.writers.get(key)
-                if entry is not None and not entry[0].stop.is_set():
-                    entry[1].add(self)
-                    self.worker = entry[0]
+                if entry is not None and not entry.worker.stop.is_set():
+                    entry.engines.add(self)
+                    entry.touched = time.monotonic()
                     STATE.engines[key] = self
-            if self.worker:
-                with self.worker.store.lock:
-                    self.worker.store.budget = self.history_budget()
-                if isinstance(self.worker.summarize,HostSummary):
-                    self.worker.summarize.update_runtime(dict(self.runtime,session_id=session_id))
-                self.worker.store.sync_hermes(home,session_id)
-                self.worker.notify()
-                self.problem = None
-                return
-            store = Store(Path(home)/"optchat",session_id,self.history_budget(),self.settings)
-            runtime = dict(self.runtime,session_id=session_id)
-            fn = self.summarizer or HostSummary(runtime,self.settings)
-            store.sync_hermes(home,session_id)
-            worker = Worker(store,self.settings,fn,on_close=lambda done: self._release_writer(key,done))
-            with STATE.lock:
-                STATE.writers[key] = (worker,weakref.WeakSet([self]))
-                self.worker = worker
-                STATE.engines[key] = self
-            worker.notify()
-            self.problem = None
-        except Exception as exc:
-            if store is not None and self.worker is None:
-                store.close()
-            self.problem = str(exc)
+                    attached, self.worker = self.worker is not entry.worker, entry.worker
+                    break
+                closing = entry.worker if entry is not None else None
+                opening = STATE.opening.setdefault(key,threading.Lock())
+            if closing is not None:
+                if not closing.closed.wait(max(0,deadline-time.monotonic())):
+                    raise ArchiveInUse("OptChat is still closing this chat's memory; send again shortly")
+                continue
+            with opening:
+                with STATE.lock:
+                    if STATE.writers.get(key) is not None:
+                        continue  # another engine of this process opened it meanwhile
+                self._open_writer(key)
+                return self.worker
+        if attached:
+            with self.worker.store.lock:
+                self.worker.store.budget = self.history_budget()
+            if isinstance(self.worker.summarize,HostSummary):
+                self.worker.summarize.update_runtime(dict(self.runtime,session_id=self.session))
+            self.worker.store.sync_hermes(self.home,self.session)
+            self.worker.notify()
+        return self.worker
+
+    def _open_writer(self, key):
+        try:
+            store = Store(Path(self.home)/"optchat",self.session,self.history_budget(),self.settings)
+        except ArchiveInUse:
+            wait = self.settings.idle_release_seconds
+            release = f"it releases the chat after {wait:g} seconds idle, then send again" if wait else "close it there first"
+            raise ArchiveInUse(f"This chat's memory is open in another Hermes app (Desktop, or the gateway Hermex uses); {release}") from None
+        try:
+            fn = self.summarizer or HostSummary(dict(self.runtime,session_id=self.session),self.settings)
+            store.sync_hermes(self.home,self.session)
+            worker = Worker(store,self.settings,fn,on_close=lambda done: _release_writer(key,done))
+        except BaseException:
+            store.close()
+            raise
+        entry = _Writer(key,worker,self)
+        with STATE.lock:
+            STATE.writers[key] = entry
+            self.worker = worker
+            STATE.engines[key] = self
+        if self.settings.idle_release_seconds:
+            threading.Thread(target=_release_when_idle,args=(entry,self.settings),
+                             name="optchat-idle-"+self.session[:12],daemon=True).start()
+        worker.notify()
 
     def begin_turn(self, turn_id, conversation_history, **kwargs):
         self.turn = turn_id
@@ -338,8 +417,13 @@ class OptChatEngine(ContextEngine):
         self.wire_anchor = None
         self.current_row_id = None
         self.admission_row_id = None
-        if self.worker:
-            self.worker.store.record_raw("turn:"+turn_id,self.user_content)
+        self.turn_recorded = False
+        if self.session and not self.problem:
+            try:
+                self.writer().store.record_raw("turn:"+turn_id,self.user_content)
+                self.turn_recorded = True
+            except ArchiveInUse:
+                pass  # select_context reports it, or records the turn once the other app releases
 
     def working_tail(self, request_messages, conversation_messages, incoming_message):
         # Hermes supplies a clone of the current canonical row with its durable ID.
@@ -416,9 +500,13 @@ class OptChatEngine(ContextEngine):
             self.progress,self.cancelled = progress,cancelled
             if cancelled is not None and cancelled():
                 raise KeyboardInterrupt("OptChat context preparation cancelled")
-            if self.problem or not self.worker:
+            if self.problem or not self.session:
                 raise RuntimeError(self.problem or "OptChat was not initialized")
-            store = self.worker.store
+            worker = self.writer()
+            store = worker.store
+            if self.turn is not None and not getattr(self,"turn_recorded",True):
+                store.record_raw("turn:"+self.turn,self.user_content)
+                self.turn_recorded = True
             if self.turn is None:
                 raise RuntimeError("OptChat pre_llm_call hook is not loaded; enable the plugin")
             tail = self.working_tail(request_messages,conversation_messages,incoming_message)
@@ -440,11 +528,11 @@ class OptChatEngine(ContextEngine):
                 # before_row synchronization already restricts the active projection
                 # to history. Version IDs are immutable, not chronological positions.
                 end = store.count()
-                self.view = self.worker.settle(end,progress=progress,cancelled=cancelled)
+                self.view = worker.settle(end,progress=progress,cancelled=cancelled)
                 store.start_turn(end)
                 self.cache_head = store.cache_head("main_cache_head",self.view,self.settings.cache_split)
             store.sync_hermes(self.home,self.session)
-            self.worker.notify()
+            worker.notify()
             systems = [copy.deepcopy(m) for m in request_messages if m.get("role") in ("system","developer")]
             if not systems:
                 systems = [{"role":"system","content":self.instructions()}]
@@ -478,55 +566,52 @@ class OptChatEngine(ContextEngine):
             raise OptChatUnavailable("OptChat stopped this request: "+str(exc)) from exc
 
     def on_turn_complete(self, messages, **kwargs):
-        if self.worker:
-            self.worker.store.sync_hermes(self.home,self.session)
-            self.worker.store.finish_turn()
-            self.worker.store.prepare(self.worker.store.unit_count())
-            self.worker.notify()
+        try:
+            worker = self.writer() if self.session and not self.problem else None
+        except ArchiveInUse:
+            worker = None  # the app holding it seals this interrupted turn on its next sync
+        if worker:
+            worker.store.sync_hermes(self.home,self.session)
+            worker.store.finish_turn()
+            worker.store.prepare(worker.store.unit_count())
+            worker.notify()
+            with STATE.lock:
+                if (entry := STATE.writers.get((self.home,self.session))) is not None and entry.worker is worker:
+                    entry.touched = time.monotonic()  # the idle clock starts when the turn ends
         self.view = None
         self.turn = None
         self.progress = None
         self.cancelled = None
 
     def on_session_end(self, session_id, messages):
-        worker = self.worker
-        if worker:
-            key = (self.home,self.session)
-            with STATE.lock:
-                attached = _attached(key,worker)
-                attached.discard(self)
-                others = list(attached)
+        key = (self.home,self.session)
+        worker = None
+        with STATE.lock:
+            entry = STATE.writers.get(key)
+            if entry is not None:
+                entry.engines.discard(self)
+                if not list(entry.engines) and not entry.worker.stop.is_set():
+                    worker = entry.worker
+                    worker.stop.set()
+            others = list(entry.engines) if entry is not None else []
+            if STATE.engines.get(key) is self:
                 if others:
-                    # Another engine still uses this writer: detach, never close it under that engine.
-                    self.worker = None
-                    if STATE.engines.get(key) is self:
-                        STATE.engines[key] = others[-1]
-            if not others:
-                try:
-                    worker.store.sync_hermes(self.home,self.session)
-                finally:
-                    # Never abandon workers when the final mirror fails. If a provider
-                    # outlives its timeout, the last exiting worker releases ownership.
-                    worker.close()
+                    STATE.engines[key] = others[-1]
+                else:
+                    STATE.engines.pop(key)
+            self.worker = None
+        if worker:
+            # The last engine of this session in this process: mirror, then release the archive.
+            try:
+                worker.store.sync_hermes(self.home,self.session)
+            finally:
+                # Never abandon workers when the final mirror fails. If a provider
+                # outlives its timeout, the last exiting worker releases ownership.
+                worker.close()
         self.view = None
         self.turn = None
         self.progress = None
         self.cancelled = None
-
-    def _release_writer(self, key, worker):
-        """The writer closed (its store is closed): detach every engine still pointing at it."""
-        with STATE.lock:
-            entry = STATE.writers.get(key)
-            engines = list(entry[1]) if entry is not None and entry[0] is worker else []
-            if entry is not None and entry[0] is worker:
-                STATE.writers.pop(key)
-            for engine in {self, *engines}:
-                if engine.worker is worker:
-                    engine.worker = None
-                    engine.view = None
-                    engine.turn = None
-            if (current := STATE.engines.get(key)) is not None and current.worker is None:
-                STATE.engines.pop(key)
 
     def get_tool_schemas(self):
         specs = [
@@ -561,9 +646,8 @@ class OptChatEngine(ContextEngine):
 
     def handle_tool_call(self, name, args, **kwargs):
         try:
-            if not self.worker:
-                raise ValueError("Archive unavailable")
-            store = self.worker.store
+            worker = self.writer()
+            store = worker.store
             archive = args.get("archive","current")
             if archive == "previous":
                 from .history import previous_call
@@ -587,7 +671,7 @@ class OptChatEngine(ContextEngine):
                         with store.lock:
                             missing = store.node(child,n//2) is None and store.audit_node(child,n//2) is None
                         if missing:
-                            self.worker.ensure(child,n//2,progress=self.progress,cancelled=self.cancelled)
+                            worker.ensure(child,n//2,progress=self.progress,cancelled=self.cancelled)
                 result = store.zoom_leaf(args["id"],args["n"],args.get("offset",0)) if unit == "leaf" else store.zoom(args["id"],args["n"],args.get("offset",0))
                 original = args["n"] == 1 and (unit == "event" or self.settings.summary_boundary == "event")
                 if original and (args.get("offset",0) == 0 or "image_offset" in args):
@@ -627,3 +711,16 @@ class OptChatEngine(ContextEngine):
                               compression_policy=self.settings.compression_policy,batching=self.settings.batching,
                               summary_error=self.worker.error)
         return result
+
+
+def _release_writer(key, worker):
+    """*worker* closed (its store is closed): unregister it and detach the engines still pointing at it.
+    They keep their session and turn, so their next use reopens the archive."""
+    with STATE.lock:
+        entry = STATE.writers.get(key)
+        engines = list(entry.engines) if entry is not None and entry.worker is worker else []
+        if entry is not None and entry.worker is worker:
+            STATE.writers.pop(key)
+        for engine in engines:
+            if engine.worker is worker:
+                engine.worker = None

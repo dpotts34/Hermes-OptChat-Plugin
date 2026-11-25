@@ -82,3 +82,9 @@ optchat:
   # Approximate fraction of the view kept as a stable head for cache reuse.
   # 0 disables splitting; valid values are from 0 up to, but not including, 1.
   cache_split: 0.3
+  # Seconds a chat must be idle (no turn, no summary work) before this Hermes app releases its memory,
+  # so another app (Desktop's backend, or the gateway Hermex uses) can continue the same chat.
+  # The releasing app reopens it on its next use. 0 never releases.
+  idle_release_seconds: 60
+  # A turn left open by an abnormal exit stops holding the chat after this many idle seconds.
+  idle_release_max_seconds: 900

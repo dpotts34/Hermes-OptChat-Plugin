@@ -118,6 +118,10 @@ def initialize_audit(db):
     """)
 
 
+class ArchiveInUse(RuntimeError):
+    """Another Hermes process holds this session's archive writer."""
+
+
 class Store:
     def __init__(self, root, session, budget, settings=None):
         from .config import Settings
@@ -129,7 +133,7 @@ class Store:
             fcntl.flock(self.lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.lockfile.close()
-            raise RuntimeError("OptChat archive already has a writer; resume it in the owning Hermes process")
+            raise ArchiveInUse("OptChat archive already has a writer; resume it in the owning Hermes process")
         self.lock = threading.RLock()
         self.db = None
         self.closed = False

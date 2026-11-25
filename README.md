@@ -100,7 +100,15 @@ the matching host integration, actual committed summary progress updates turn li
 idle wait ticks and already-ready reads do not count as progress. Stop produces a normal
 interrupted turn; preparation failures use `ContextEngineError` and produce an error
 receipt without sending an unbounded transcript. Background summaries may continue
-after a cancelled foreground wait until the owning session closes.
+after a cancelled foreground wait until the chat goes idle.
+
+One Hermes process at a time writes a chat's archive. Every agent Hermes builds for the
+chat in that process shares it. Long-running apps (the gateway that phone clients such as
+Hermex use, and Desktop's backend) never end a chat's session, so a chat with no turn and
+no summary work for `idle_release_seconds` (default 60) is released and reopened on that
+app's next use; pending summaries stay queued in the archive and continue there. While
+another app holds the chat, a turn stops with a message saying so; send it again once that
+app has been idle for the configured time.
 
 ## Context Illustration
 
